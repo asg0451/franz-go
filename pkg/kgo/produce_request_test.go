@@ -669,9 +669,7 @@ func TestClient_ProduceReproDeadlock(t *testing.T) {
 			default:
 			}
 			time.Sleep(5 * time.Second)
-			stats.Lock()
-			log.Printf("succeeded: %+v, goodcancel: %+v", stats.succeeded, stats.goodcancel)
-			stats.Unlock()
+			stats.Print()
 		}
 	}()
 
@@ -763,7 +761,7 @@ func (l *bufLogger) Printf(format string, args ...any) {
 	l.Lock()
 	defer l.Unlock()
 	l.logs = append(l.logs, fmt.Sprintf(format, args...))
-	l.logs = l.logs[len(l.logs)-100:] // keep last 100 logs
+	l.logs = l.logs[len(l.logs)-min(100, len(l.logs)):]
 }
 
 func (l *bufLogger) PrintTail() {
@@ -785,8 +783,15 @@ func (s *stats) incrSucceeded(n int) {
 	defer s.Unlock()
 	s.succeeded[n]++
 }
+
 func (s *stats) incrGoodcancel(n int) {
 	s.Lock()
 	defer s.Unlock()
 	s.goodcancel[n]++
+}
+
+func (s *stats) Print() {
+	s.Lock()
+	defer s.Unlock()
+	log.Printf("succeeded: %+v, goodcancel: %+v", s.succeeded, s.goodcancel)
 }
