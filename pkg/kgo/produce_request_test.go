@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"hash/crc32"
+	"log"
 	"math/rand"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -614,5 +618,169 @@ func BenchmarkAppendBatch(b *testing.B) {
 			}
 			b.Log(len(buf))
 		})
+	}
+}
+
+func TestClient_ProduceReproDeadlock(t *testing.T) {
+	var (
+		topic, cleanup = tmpTopicPartitions(t, 1)
+		batchSize      = 1000
+
+		randRec = func() *Record {
+			return &Record{
+				Key:   []byte("test"),
+				Value: []byte(strings.Repeat("x", rand.Intn(100))),
+				Topic: topic,
+			}
+		}
+		par = max(runtime.GOMAXPROCS(0), 8)
+	)
+	defer cleanup()
+
+	opts := []Opt{
+		DisableIdempotentWrite(),
+		ProducerBatchMaxBytes(256 << 20), // 256MiB
+		BrokerMaxWriteBytes(1 << 30),     // 1GiB
+		AllowAutoTopicCreation(),
+		RecordRetries(5),
+		RequestRetries(5),
+		ProducerOnDataLossDetected(func(topic string, part int32) { log.Printf("data loss detected on %s[%d]", topic, part) }),
+		MaxBufferedRecords(1000),
+		WithLogger(BasicLogger(os.Stderr, LogLevelInfo, nil)),
+	}
+
+	ctx := context.Background()
+
+	shutdown := make(chan struct{})
+	shutdownOnce := sync.Once{}
+
+	logs := struct {
+		sync.Mutex
+		logs []string
+	}{}
+
+	addLog := func(s string) {
+		logs.Lock()
+		defer logs.Unlock()
+		logs.logs = append(logs.logs, s)
+	}
+
+	stats := struct {
+		sync.Mutex
+		succeeded  map[int]int
+		goodcancel map[int]int
+	}{}
+	stats.succeeded = make(map[int]int)
+	stats.goodcancel = make(map[int]int)
+
+	incrSucceeded := func(n int) {
+		stats.Lock()
+		defer stats.Unlock()
+		stats.succeeded[n]++
+	}
+	incrGoodcancel := func(n int) {
+		stats.Lock()
+		defer stats.Unlock()
+		stats.goodcancel[n]++
+	}
+
+	go func() {
+		for {
+			select {
+			case <-shutdown:
+				return
+			default:
+			}
+			time.Sleep(5 * time.Second)
+			stats.Lock()
+			log.Printf("succeeded: %+v, goodcancel: %+v", stats.succeeded, stats.goodcancel)
+			stats.Unlock()
+		}
+	}()
+
+	maybeCancel := func(n int, cb func(ctx context.Context)) {
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		// avg time is 50ms
+		go func() {
+			time.Sleep(time.Duration(rand.Int63n(200) * int64(time.Millisecond)))
+			cancel()
+			addLog(fmt.Sprintf("[%d] canceled ctx", n))
+		}()
+
+		// monitor for it taking too long ie getting stuck
+		done := make(chan struct{})
+		go func() {
+			select {
+			case <-time.After(5 * time.Second):
+				log.Printf("[%d] **timed out**", n)
+				t.Fail()
+				shutdownOnce.Do(func() { close(shutdown) })
+			case <-done:
+			}
+		}()
+
+		cb(ctx)
+		close(done)
+	}
+
+	// with this global client it fails reliably
+	// cl, _ := newTestClient(opts...)
+	// defer cl.Close()
+
+	for n := 0; n < par; n++ {
+		n := n
+		go func() {
+			// NOTE: i get this to fail reliably when i share the client here. I don't think Produce is supposed to be thread safe anyway but maybe that's a clue?
+			cl, _ := newTestClient(opts...)
+			defer cl.Close()
+			var batch []*Record
+
+			for {
+				select {
+				case <-shutdown:
+					return
+				default:
+				}
+
+				// TODO: try with race, deadlock detector?
+
+				batch = append(batch, randRec())
+
+				if len(batch) >= batchSize {
+					// vary timings by throwing in little sleeps here and there. to simulate non-full load?
+					time.Sleep(time.Duration(rand.Int63n(500) * int64(time.Millisecond)))
+
+					maybeCancel(n, func(ctx context.Context) {
+						res := cl.ProduceSync(ctx, batch...)
+						if err := res.FirstErr(); err != nil {
+							if errors.Is(err, context.Canceled) {
+								addLog(fmt.Sprintf("[%d] produce failed bc ctx was canceled", n))
+								incrGoodcancel(n)
+								return
+							}
+							addLog(fmt.Sprintf("[%d] produce failed: %v", n, err))
+							t.Fail()
+							shutdownOnce.Do(func() { close(shutdown) })
+						} else {
+							addLog(fmt.Sprintf("[%d] produced %d records", n, len(batch)))
+							incrSucceeded(n)
+						}
+					})
+					batch = batch[:0]
+				}
+			}
+		}()
+	}
+
+	<-shutdown
+
+	// print last 50 logs
+	fmt.Printf("last few logs:\n")
+	logs.Lock()
+	defer logs.Unlock()
+	for _, log := range logs.logs[len(logs.logs)-min(50, len(logs.logs)):] {
+		fmt.Printf("%s\n", log)
 	}
 }

@@ -26,7 +26,7 @@ import (
 
 var (
 	adm             *Client
-	testrf          = 3
+	testrf          = 1
 	testRecordLimit = 500000
 
 	// Kraft sometimes has massive hangs internally when completing
