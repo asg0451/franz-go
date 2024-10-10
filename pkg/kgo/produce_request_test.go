@@ -16,6 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"net/http"
+	_ "net/http/pprof"
+
 	"github.com/twmb/franz-go/pkg/kbin"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
@@ -622,6 +625,11 @@ func BenchmarkAppendBatch(b *testing.B) {
 }
 
 func TestClient_ProduceReproDeadlock(t *testing.T) {
+
+	go func() {
+		http.ListenAndServe("localhost:6060", nil)
+	}()
+
 	var (
 		topic, cleanup = tmpTopicPartitions(t, 1)
 		batchSize      = 1000
