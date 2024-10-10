@@ -649,41 +649,18 @@ func TestClient_ProduceReproDeadlock(t *testing.T) {
 		WithLogger(BasicLogger(os.Stderr, LogLevelInfo, nil)),
 	}
 
+	// things to try:
+	// - [ ] add transient kafka/network errors
+
 	ctx := context.Background()
 
 	shutdown := make(chan struct{})
 	shutdownOnce := sync.Once{}
 
-	logs := struct {
-		sync.Mutex
-		logs []string
-	}{}
-
-	addLog := func(s string) {
-		logs.Lock()
-		defer logs.Unlock()
-		logs.logs = append(logs.logs, s)
+	stats := &stats{
+		succeeded:  make(map[int]int),
+		goodcancel: make(map[int]int),
 	}
-
-	stats := struct {
-		sync.Mutex
-		succeeded  map[int]int
-		goodcancel map[int]int
-	}{}
-	stats.succeeded = make(map[int]int)
-	stats.goodcancel = make(map[int]int)
-
-	incrSucceeded := func(n int) {
-		stats.Lock()
-		defer stats.Unlock()
-		stats.succeeded[n]++
-	}
-	incrGoodcancel := func(n int) {
-		stats.Lock()
-		defer stats.Unlock()
-		stats.goodcancel[n]++
-	}
-
 	go func() {
 		for {
 			select {
@@ -698,15 +675,17 @@ func TestClient_ProduceReproDeadlock(t *testing.T) {
 		}
 	}()
 
+	bufLog := &bufLogger{}
+
 	maybeCancel := func(n int, cb func(ctx context.Context)) {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		// avg time is 50ms
+		// empirically the avg time to producesync is 50ms
 		go func() {
 			time.Sleep(time.Duration(rand.Int63n(200) * int64(time.Millisecond)))
 			cancel()
-			addLog(fmt.Sprintf("[%d] canceled ctx", n))
+			bufLog.Printf("[%d] canceled ctx", n)
 		}()
 
 		// monitor for it taking too long ie getting stuck
@@ -744,8 +723,6 @@ func TestClient_ProduceReproDeadlock(t *testing.T) {
 				default:
 				}
 
-				// TODO: try with race, deadlock detector?
-
 				batch = append(batch, randRec())
 
 				if len(batch) >= batchSize {
@@ -756,16 +733,16 @@ func TestClient_ProduceReproDeadlock(t *testing.T) {
 						res := cl.ProduceSync(ctx, batch...)
 						if err := res.FirstErr(); err != nil {
 							if errors.Is(err, context.Canceled) {
-								addLog(fmt.Sprintf("[%d] produce failed bc ctx was canceled", n))
-								incrGoodcancel(n)
+								bufLog.Printf("[%d] produce failed bc ctx was canceled", n)
+								stats.incrGoodcancel(n)
 								return
 							}
-							addLog(fmt.Sprintf("[%d] produce failed: %v", n, err))
+							bufLog.Printf("[%d] produce failed: %v", n, err)
 							t.Fail()
 							shutdownOnce.Do(func() { close(shutdown) })
 						} else {
-							addLog(fmt.Sprintf("[%d] produced %d records", n, len(batch)))
-							incrSucceeded(n)
+							bufLog.Printf("[%d] produced %d records", n, len(batch))
+							stats.incrSucceeded(n)
 						}
 					})
 					batch = batch[:0]
@@ -775,12 +752,41 @@ func TestClient_ProduceReproDeadlock(t *testing.T) {
 	}
 
 	<-shutdown
+}
 
-	// print last 50 logs
-	fmt.Printf("last few logs:\n")
-	logs.Lock()
-	defer logs.Unlock()
-	for _, log := range logs.logs[len(logs.logs)-min(50, len(logs.logs)):] {
+type bufLogger struct {
+	sync.Mutex
+	logs []string
+}
+
+func (l *bufLogger) Printf(format string, args ...any) {
+	l.Lock()
+	defer l.Unlock()
+	l.logs = append(l.logs, fmt.Sprintf(format, args...))
+	l.logs = l.logs[len(l.logs)-100:] // keep last 100 logs
+}
+
+func (l *bufLogger) PrintTail() {
+	l.Lock()
+	defer l.Unlock()
+	for _, log := range l.logs {
 		fmt.Printf("%s\n", log)
 	}
+}
+
+type stats struct {
+	sync.Mutex
+	succeeded  map[int]int
+	goodcancel map[int]int
+}
+
+func (s *stats) incrSucceeded(n int) {
+	s.Lock()
+	defer s.Unlock()
+	s.succeeded[n]++
+}
+func (s *stats) incrGoodcancel(n int) {
+	s.Lock()
+	defer s.Unlock()
+	s.goodcancel[n]++
 }
